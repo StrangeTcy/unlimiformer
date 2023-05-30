@@ -3,22 +3,58 @@ import numpy as np
 import torch
 from torch import nn
 from enum import Enum, auto
-from unlimiformer import Unlimiformer, ModelType, UnlimiformerBART, UnlimiformerT5, UnlimiformerLED
-from transformers import BartModel, BartForConditionalGeneration, \
-    T5Model, T5ForConditionalGeneration, \
-    LEDModel, LEDForConditionalGeneration, \
-    AutoModelForSeq2SeqLM
+
+from models.unlimiformer import (Unlimiformer, 
+        ModelType, 
+        UnlimiformerBART, 
+        UnlimiformerT5, 
+        UnlimiformerLED,
+        UnlimiformerLlama,
+        UnlimiformerLlamaWithFlashAttn)
+
+from transformers import (BartModel, 
+    BartForConditionalGeneration, 
+    T5Model, 
+    T5ForConditionalGeneration, 
+    LEDModel, 
+    LEDForConditionalGeneration, 
+    LlamaModel,
+    LlamaModelWithFlashAttn,
+    LlamaForCausalLM,
+    LlamaForCausalLMWithFlashAttn,
+    AutoModelForSeq2SeqLM)
+
+
+
 
 class RandomTrainingUnlimiformer(Unlimiformer[ModelType]):
-    def __init__(self, model: ModelType, *args, **kwargs):
+    def __init__(self, 
+                 model: ModelType, 
+                 random_knn_initial_inputs=False, 
+                 *args, 
+                 **kwargs):
+        print("RandomTrainingUnlimiformer is calling super().__init__ ...")
         super().__init__(model, *args, **kwargs)
         self.training_hooks_injected = False
+        self.random_knn_initial_inputs = random_knn_initial_inputs
         self.train_step = 0
+        #print(f"in __init__, we have args {args} and kwargs {kwargs}")
+        self.knn_training = kwargs["knn_training"]
+
 
     @classmethod
     def convert_model(cls, model, *args, **kwargs):
-        model_clone = AutoModelForSeq2SeqLM.from_config(model.config)
-        model_clone.load_state_dict(model.state_dict())
+        # print(f"convert_model has just received model {model}, it has methods {dir(model)}")
+        # print(f"it has name {model._get_name} and another name {model.name_or_path}")
+        # input("ok?")
+        
+        if "llama" in model.name_or_path:
+            # TODO: is this the best way to handle this?
+            model_clone = model
+        else:
+            model_clone = AutoModelForSeq2SeqLM.from_config(model.config)
+            model_clone.load_state_dict(model.state_dict())
+        
         type_to_class = {
             BartModel: RandomUnlimiformerBART,
             BartForConditionalGeneration: RandomUnlimiformerBART,
@@ -26,14 +62,25 @@ class RandomTrainingUnlimiformer(Unlimiformer[ModelType]):
             T5ForConditionalGeneration: RandomUnlimiformerT5,
             LEDModel: RandomUnlimiformerLED,
             LEDForConditionalGeneration: RandomUnlimiformerLED,
+            LlamaModel: RandomUnlimiformerLlama,
+            LlamaForCausalLM: RandomUnlimiformerLlama,
+            LlamaForCausalLMWithFlashAttn: RandomUnlimiformerLlamaWithFlashAttn,
         }
-        type_to_class[type(model_clone)](model_clone, *args, **kwargs)
-        return model_clone
+        
+        model = type_to_class[type(model_clone)](model_clone, *args, **kwargs)
+        
+        print(f"we'll be returning this model: {model}")
+        # input("are you sure that's what you want?")
+        
+
+        return model
+
 
     def pre_eval_hook(self):
         self.remove_training_hooks(self.model)
         self.inject_hooks(self.model)   
         self.original_model_eval_func()
+
 
     def pre_train_hook(self, mode=True):
         # mode=True means model.train() is called
@@ -42,20 +89,21 @@ class RandomTrainingUnlimiformer(Unlimiformer[ModelType]):
         if mode is True:
             self.break_out(self.model)
             self.remove_training_hooks(self.model)
-            if self.unlimiformer_training and self.train_step % 2 == 0:
+            if self.knn_training and self.train_step % 2 == 0:
                 super().inject_training_hooks(self.model)
             else:
                 self.inject_training_hooks(self.model)
             self.train_step += 1
         self.original_model_train_func(mode)
     
+
     def inject_training_hooks(self, model):
         if self.training_hooks_injected:
             return
         # self.original_forward_func = model.forward
         model.forward = self.random_inputs_forward_hook
 
-        decoder_layers_to_run = self.attention_layer_to_run(self.layer_begin, self.layer_end)
+        decoder_layers_to_run = self.attention_layer_to_run(self.knn_layer_begin, self.knn_layer_end)
         
         self.original_decoder_layer_self_attn_forward_funcs = []
         for decoder_layer in decoder_layers_to_run:
@@ -77,12 +125,14 @@ class RandomTrainingUnlimiformer(Unlimiformer[ModelType]):
 
         self.training_hooks_injected = True
 
+
     def create_self_attn_random_pre_forward_hook(self, original_self_attn_forward_func):
         def self_attention_pre_forward_hook(*args, **kwargs):
             kwargs['past_key_value'] = None
             return original_self_attn_forward_func(*args, **kwargs)
         
         return self_attention_pre_forward_hook
+
 
     def create_decoder_layer_random_func(self, decoder_layer_original_forward_func, decoder_layer):
         def checkpointed_decoder_layer(
@@ -100,11 +150,20 @@ class RandomTrainingUnlimiformer(Unlimiformer[ModelType]):
 
             
             
-            def sample_and_forward(hidden_states, attention_mask, 
-                    encoder_hidden_states, encoder_attention_mask, layer_head_mask, 
-                    cross_attn_layer_head_mask, past_key_value, 
-                    output_attentions, use_cache, long_inputs, long_inputs_mask, rand_indices,
-                    position_bias, encoder_decoder_position_bias):
+            def sample_and_forward(hidden_states, 
+                                attention_mask, 
+                                encoder_hidden_states,
+                                encoder_attention_mask, 
+                                layer_head_mask, 
+                                cross_attn_layer_head_mask, 
+                                past_key_value, 
+                                output_attentions, 
+                                use_cache, 
+                                long_inputs, 
+                                long_inputs_mask, 
+                                rand_indices,
+                                position_bias, 
+                                encoder_decoder_position_bias):
                 
                 sampled_input, _ = self.sample_long_input(long_inputs, long_inputs_mask, rand_indices)
                 key, value = self.create_key_value(sampled_input, decoder_layer)
@@ -131,13 +190,24 @@ class RandomTrainingUnlimiformer(Unlimiformer[ModelType]):
                 rand_indices = self.sample_random_indices()
 
             return torch.utils.checkpoint.checkpoint(
-                sample_and_forward, hidden_states, attention_mask, 
-                encoder_hidden_states, encoder_attention_mask, layer_head_mask, 
-                cross_attn_layer_head_mask, None, 
-                output_attentions, use_cache, self.long_inputs_encoded, self.long_inputs_mask, rand_indices,
-                position_bias, encoder_decoder_position_bias)
+                sample_and_forward, 
+                hidden_states, 
+                attention_mask, 
+                encoder_hidden_states, 
+                encoder_attention_mask, 
+                layer_head_mask, 
+                cross_attn_layer_head_mask, 
+                None, 
+                output_attentions, 
+                use_cache, 
+                self.long_inputs_encoded, 
+                self.long_inputs_mask, 
+                rand_indices,
+                position_bias, 
+                encoder_decoder_position_bias)
 
         return checkpointed_decoder_layer
+
 
     def sample_random_indices(self):
         rand_indices_list = []
@@ -156,17 +226,19 @@ class RandomTrainingUnlimiformer(Unlimiformer[ModelType]):
         rand_indices = torch.stack(rand_indices_list, dim=0)
         return rand_indices
 
+
     def random_inputs_forward_hook(self, input_ids=None, attention_mask=None, labels=None, **kwargs):
         self.model.base_model.decoder.gradient_checkpointing = False
         self.long_inputs_encoded, self.long_inputs_mask = self.chunked_encode_input(input_ids=input_ids, attention_mask=attention_mask)
 
         #  TODO: should the inputs be sampled or the truncated beginning?
-        # if self.random_knn_initial_inputs:
-        #     encoded_inputs, encoded_inputs_mask = self.sample_long_input(self.long_inputs_encoded, self.long_inputs_mask)
-        # else:
-        encoded_inputs = self.long_inputs_encoded[:, :self.actual_model_window_size]
-        encoded_inputs_mask = self.long_inputs_mask[:, :self.actual_model_window_size]
+        if self.random_knn_initial_inputs:
+            encoded_inputs, encoded_inputs_mask = self.sample_long_input(self.long_inputs_encoded, self.long_inputs_mask)
+        else:
+            encoded_inputs = self.long_inputs_encoded[:, :self.actual_model_window_size]
+            encoded_inputs_mask = self.long_inputs_mask[:, :self.actual_model_window_size]
         return self.original_forward_func(encoder_outputs=(encoded_inputs, ), labels=labels, attention_mask=encoded_inputs_mask, **kwargs)
+
 
     def sample_long_input(self, long_inputs_encoded, long_inputs_mask, random_indices=None):
         if long_inputs_mask.shape[-1] < self.actual_model_window_size:
@@ -181,6 +253,7 @@ class RandomTrainingUnlimiformer(Unlimiformer[ModelType]):
         sampled_mask = long_inputs_mask[random_mask].reshape(batch_size, self.actual_model_window_size).to(self.device)
         return sampled_input, sampled_mask
 
+
     def chunked_encode_input(self, input_ids, attention_mask):
         long_inputs_encoded = []
         long_inputs_mask = []
@@ -190,7 +263,11 @@ class RandomTrainingUnlimiformer(Unlimiformer[ModelType]):
         for context_start_ind, context_end_ind, update_start_ind, update_end_ind in window_indices:
             chunk = input_ids[:, context_start_ind:context_end_ind]
             chunk_attention_mask = attention_mask[:, context_start_ind:context_end_ind]
-            output = self.model.base_model.encoder(chunk, attention_mask=chunk_attention_mask, return_dict=True, output_hidden_states=True)
+            if self.is_encoder_decoder:
+                output = self.model.base_model.encoder(chunk, attention_mask=chunk_attention_mask, return_dict=True, output_hidden_states=True)
+            else:
+                output = self.model.base_model(chunk, attention_mask=chunk_attention_mask, return_dict=True, output_hidden_states=True)
+
             encoder_last_hidden_state = output.last_hidden_state # (batch, time, dim)
             
             # list of (batch, head, chunked_time, dim)
@@ -211,14 +288,38 @@ class RandomTrainingUnlimiformer(Unlimiformer[ModelType]):
             print()
         return long_inputs_encoded, long_inputs_mask
 
+
+
+
 class RandomUnlimiformerBART(RandomTrainingUnlimiformer[BartModel], UnlimiformerBART):
     def __init__(self, model: BartModel, *args, **kwargs):
         super().__init__(model, *args, **kwargs)
+
 
 class RandomUnlimiformerT5(RandomTrainingUnlimiformer[T5Model], UnlimiformerT5):
     def __init__(self, model: T5Model, *args, **kwargs):
         super().__init__(model, *args, **kwargs)
 
+
 class RandomUnlimiformerLED(RandomTrainingUnlimiformer[LEDModel], UnlimiformerLED):
     def __init__(self, model: LEDModel, *args, **kwargs):
-        super().__init__(model, *args, **kwargs)
+        super().__init__(model, *args, **kwargs)    
+
+
+class RandomUnlimiformerLlama(RandomTrainingUnlimiformer[LlamaModel]):
+    def __init__(self, model: LlamaModel, *args, **kwargs):
+        super().__init__(model, *args, **kwargs)  
+
+    def window_size(self):
+        # TODO: max_position_embeddings vs n_positions
+        return self.model.config.max_position_embeddings
+
+
+class RandomUnlimiformerLlamaWithFlashAttn(RandomTrainingUnlimiformer[LlamaModelWithFlashAttn]):
+    def __init__(self, model: LlamaModelWithFlashAttn, *args, **kwargs):
+        super().__init__(model, *args, **kwargs)  
+
+    def window_size(self):
+        # TODO: max_position_embeddings vs n_positions
+        return self.model.config.max_position_embeddings
+
