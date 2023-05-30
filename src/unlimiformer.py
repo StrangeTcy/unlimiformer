@@ -1,34 +1,92 @@
+# this is adapted from the official unlimiformer repo:
+# https://github.com/abertsch72/unlimiformer/blob/main/src/unlimiformer.py
+# changes, comments and additions by StrangeTcy
+
+
 import logging
 import numpy as np
 import torch
 from torch import nn
 from enum import Enum, auto
-from transformers import BartModel, BartForConditionalGeneration, \
-    T5Model, T5ForConditionalGeneration, \
-    LEDModel, LEDForConditionalGeneration, \
-    AutoModelForSeq2SeqLM
+from transformers import (BartModel, 
+                          BartForConditionalGeneration, 
+                          T5Model, 
+                          T5ForConditionalGeneration, 
+                          LEDModel, 
+                          LEDForConditionalGeneration, 
+                          LlamaModel,
+                          LlamaForCausalLM, 
+                          LlamaForCausalLMWithFlashAttn,
+                          AutoModelForSeq2SeqLM)
 
 from typing import TypeVar, Generic
 
-from index_building import Datastore, DatastoreBatch
+from models.index_building import Datastore, DatastoreBatch
+
+from tqdm.auto import tqdm, trange
+
+# for sys.exit
+import sys
+
+
 
 logger = logging.getLogger('attention_knn')
 logger.setLevel(20)
 
 ModelType = TypeVar('ModelType')
+
+
+
+
+
+class ActivationCapturer(nn.Module):
+    def __init__(self, 
+                layer, 
+                capture_input=False):
+        super().__init__()
+        self.layer = layer
+        self.capture_input = capture_input
+
+        self.captured = None
+
+    
+    def forward(self, 
+                module, 
+                input, 
+                output):
+        self.captured = input if self.capture_input else output
+        if not self.layer.training:
+            self.captured = self.captured.detach()
+
+
+
+
+# I have no idea what Generics and TypeVars do
+# TODO: figure out
 class Unlimiformer(Generic[ModelType]):
-    def __init__(self, model: ModelType, 
-            layer_begin=-1, layer_end=None,
-            unlimiformer_head_num=None, normalize=False, 
+    def __init__(self, 
+            model: ModelType, 
+            layer_begin=-1, 
+            layer_end=None,
+            unlimiformer_head_num=None, 
+            normalize=False, 
             exclude_attention=False, 
             model_encoder_max_len=None,
             chunk_overlap=0,
-            verbose=False, save_heatmap=False, 
-            tokenizer=None, unlimiformer_training=False,
+            verbose=False, 
+            save_heatmap=False, 
+            tokenizer=None, 
+            unlimiformer_training=False,
             use_datastore=False, 
             flat_index=False,
-            test_datastore=False, reconstruct_embeddings=False, 
-            gpu_datastore=False, gpu_index=False):
+            test_datastore=False, 
+            reconstruct_embeddings=False, 
+            gpu_datastore=False, 
+            gpu_index=False,
+            knn_training=False,):
+        
+        print("Actual real Unlimiformer.__init__ was just called...")
+
         self.model = model
         self.layer_begin = layer_begin
         self.layer_end = layer_end
@@ -50,6 +108,12 @@ class Unlimiformer(Generic[ModelType]):
         self.gpu_index = gpu_index
         self.test_datastore = test_datastore # flag for debugging
 
+        self.knn_training = knn_training
+
+
+        # this might not scale well 
+        # to a multi-GPU env
+        # TODO: be on the lookout
         self.device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
         self.activation_capturer = None
         self.is_encoder_decoder = model.config.is_encoder_decoder
@@ -62,50 +126,258 @@ class Unlimiformer(Generic[ModelType]):
         self.cur_decoder_layer_index = None
         self.datastore = None
 
+        print("calling self.break_into...")
         self.break_into(model)
 
+
+    # this is copied from UnlimiformerBart
+    def attention_layer_to_run(self, layer_begin, layer_end): 
+        print(f"our model is {self.model.base_model}")
+        # input("ok?")
+        return self.model.base_model.layers[layer_begin:layer_end]
+
+
+    # this is copied from UnlimiformerBart
+    def self_attention(self, decoder_layer):
+        return decoder_layer.self_attn 
+
+
+    # this is copied from UnlimiformerBart
+    # and adapted for LLaMA
+    def cross_attention(self, decoder_layer):
+        #print(f"cross_attention got layer {decoder_layer}")
+        # return decoder_layer.encoder_attn
+        return decoder_layer.self_attn
+    
+
+    # this is copied from UnlimiformerBart
+    # and adapted for LLaMA
+    def attention_op_to_run(self, layer_begin, layer_end):
+        # return [
+        #         layer.encoder_attn.q_proj
+        #             for layer 
+        #             in self.model.base_model.decoder.layers[layer_begin:layer_end]
+        #     ]
+    
+        return [
+            layer.self_attn.q_proj
+                for layer 
+                in self.model.base_model.layers[layer_begin:layer_end]
+        ]
+
+
+    # this is copied
+    # from UnlimiformerBart
+    def create_key_value(self, 
+                        hidden_states,
+                        encoder_hidden_states, 
+                        decoder_layer):
+        # (batch, time, hidden_dim)
+        
+        # TODO: figure out the correct names:
+        # this is called encoder_attn in Bart
+        # and layer[1].EncDecAttention in T5
+        # print(f"our decoder_layer is {decoder_layer}")
+        # input("cool?")
+        # attention = decoder_layer.encoder_attn
+        
+        # LLaMA has no encoder_attn since it has no encoders
+        #  but it **does** have self_attn
+        attention = decoder_layer.self_attn
+        
+        
+        # key, value: (batch, heads, time, attn_dim)
+        # TODO: k_proj vs k
+
+        # what we have here as encoder_hidden_states
+        # is None
+
+        if self.is_encoder_decoder:
+            key = attention.k_proj(encoder_hidden_states)
+        else:
+            print(f"Well, we're using a model that is not encoder-decoder: \nself.is_encoder_decoder is {self.is_encoder_decoder}")
+            key = attention.k_proj(hidden_states)
+
+
+
+        # TODO: num_heads vs n_heads, 
+        # head_dim vs key_value_proj_dim
+        key = key.view(key.shape[0], -1, attention.num_heads, attention.head_dim).transpose(1, 2).contiguous()
+        
+        # TODO: v_proj vs v
+        
+        if self.is_encoder_decoder:
+            value = attention.v_proj(encoder_hidden_states)
+        else:
+            print(f"Well, we're using a model that is not encoder-decoder: \nself.is_encoder_decoder is {self.is_encoder_decoder}")
+            value = attention.v_proj(hidden_states)
+        
+        value = value.view(value.shape[0], -1, attention.num_heads, attention.head_dim).transpose(1, 2).contiguous()
+
+        # key, value: (batch, heads, time, attn_dim)
+        return key, value 
+
+
+    # this is copied
+    # from UnlimiformerBart
+    def create_decoder_layer_args(self, 
+                                hidden_states, 
+                                attention_mask, 
+                                encoder_hidden_states,
+                                encoder_attention_mask, 
+                                layer_head_mask, 
+                                cross_attn_layer_head_mask,
+                                past_key_value, 
+                                output_attentions, 
+                                position_bias,
+                                encoder_decoder_position_bias, 
+                                use_cache, 
+                                key, 
+                                value):
+        
+        # TODO: position_bias,
+        # encoder_decoder_position_bias ??
+        args = {'hidden_states': hidden_states, 
+                'attention_mask': attention_mask, 
+                'encoder_hidden_states': encoder_hidden_states, 
+                'encoder_attention_mask': encoder_attention_mask, 
+                'layer_head_mask': layer_head_mask, 
+                'cross_attn_layer_head_mask': cross_attn_layer_head_mask, 
+                'past_key_value': (None, None, key, value), 
+                'output_attentions': output_attentions, 
+                'use_cache': use_cache,}
+        
+        if self.is_encoder_decoder:
+            print("in create_decoder_layer_args, removing unnecessary items from the args dict...")
+            args.pop("encoder_hidden_states", None)
+
+        if key is None and value is None:
+            args['past_key_value'] = None
+        return args
+    
+
+    # this is copied
+    # from UnlimiformerBart
+    def process_query(self, output):
+        # (batch, time, heads, attn_dim)
+        # attention = self.model.base_model.decoder.layers[-1].encoder_attn
+        attention = self.model.base_model.layers[-1].self_attn
+
+        # query: (batch, heads, time, attn_dim)
+        # query = output.view(output.shape[0], output.shape[1], attention.num_heads, attention.head_dim).transpose(1, 2).contiguous()
+        query = output.view(output.shape[0], output.shape[1], attention.num_heads, attention.head_dim).contiguous()
+        return query
+
+
+
+    # this is copied
+    # from UnlimiformerBart
+    def attention_layer_to_capture(self, layer_begin, layer_end): 
+        if self.is_encoder_decoder:
+            magic_list = [
+            [layer.encoder_attn.k_proj, layer.encoder_attn.v_proj]
+            for layer 
+            in self.model.base_model.decoder.layers[layer_begin:layer_end]
+            ]
+        else:
+            magic_list = [
+            [layer.self_attn.k_proj, layer.self_attn.v_proj]
+            for layer 
+            in self.model.base_model.layers[layer_begin:layer_end]
+            ]
+
+        return magic_list 
+
+
+
+
+
+
     def break_into(self, model):
+        print("Unlimiformer.break_into was just called...")
+        print("setting model window size...")
         self.actual_model_window_size = self.window_size()
         if self.model_encoder_max_len is None:
             self.model_encoder_max_len = self.actual_model_window_size
         self.window_margin = int(self.model_encoder_max_len * self.chunk_overlap / 2)
         self.num_heads = model.config.num_attention_heads
+        print(f"sanity check: self.num_heads is {self.num_heads}")
         if self.specific_head is None:
+            # fancy
+            # see https://realpython.com/python-ellipsis/
+            # for an explanation
             self.head_nums = Ellipsis # torch.arange(0, self.num_heads, device=self.device)
         else:
             self.head_nums = self.specific_head
+        # Save a reference to the wrapper
+        model.knn_wrapper = self
         self.hooks_injected = False
         self.training_hooks_injected = False
+        print("at the moment no hooks are injected...")
         self.original_forward_func = model.forward
 
-        # Activate AttentionKNN when calling model.eval(), deactivate for model.train()
+        # Activate AttentionKNN when calling model.eval(), 
+        # deactivate for model.train()
+        print("setting our pre_***_hooks:")
         self.original_model_eval_func = model.eval
+        print("model.eval = self.pre_eval_hook...")
         model.eval = self.pre_eval_hook
+        print("explicitly calling model.eval from Unlimiformer.break_into...")
+        model.eval()
+        # input("cool?")
+
         self.original_model_train_func = model.train
+        print("model.train = self.pre_train_hook...")
         model.train = self.pre_train_hook
 
+
     def pre_eval_hook(self):
+        print("pre_eval_hook was called...")
+
+        print("removing training hooks...")
         self.remove_training_hooks(self.model)
+
+        print("and now we're injecting hooks...")
         self.inject_hooks(self.model)
+
+        print("calling self.original_model_eval_func(). For some reason...")
         self.original_model_eval_func()
 
+
     def pre_train_hook(self, mode=True):
+        # TODO: possibly switch to explicit use of
+        # "train"/"eval" instead of True/False
+
         # mode=True means model.train() is called
         # mode=False means model.eval() is called
+        print(f"Unlimiformer.pre_train_hook was just called, and mode was {mode}...")
         torch.cuda.empty_cache()
         if mode is True:
+            print("calling self.break_out...")
             self.break_out(self.model)
             if self.unlimiformer_training:
+                print("calling self.inject_training_hooks")
                 self.inject_training_hooks(self.model)
         self.original_model_train_func(mode)
         
+
     def inject_hooks(self, model):
+        print("inject_hooks was called, injecting these hooks!")
+        print("🪝"*5)
+        print("---===|||===---")
+
+
         if self.hooks_injected:
             return
-        # Inject our activation_capturer to capture the activations at every forward pass
+        # Inject our activation_capturer 
+        # to capture the activations at every forward pass
+        
         attention_layers_to_capture = self.attention_layer_to_capture(self.layer_begin, self.layer_end)
+        print(f"and now our attention_layers_to_capture are {attention_layers_to_capture}")
         self.activation_capturer = []
-        for layer in attention_layers_to_capture:
+        print("injecting our activation_capturer...")
+        # input("ok?")
+        for layer in tqdm(attention_layers_to_capture):
             if type(layer) is list:
                 layer_capturers = []
                 for k_or_v in layer:
@@ -118,9 +390,11 @@ class Unlimiformer(Generic[ModelType]):
                 self.register_hook(attention_layers_to_capture, capturer)
                 self.activation_capturer.append(capturer)
 
-        # Inject our main function after the main attention function
+        # Inject our main function 
+        # after the main attention function
         attention_layers_to_run = self.attention_op_to_run(self.layer_begin, self.layer_end)
-        for layer in attention_layers_to_run:
+        for layer in tqdm(attention_layers_to_run):
+            print("registering attention forward hook...")
             self.register_hook(layer, self.attention_forward_hook)
 
         decoder_layers_to_run = self.attention_layer_to_run(self.layer_begin, self.layer_end)
@@ -130,51 +404,73 @@ class Unlimiformer(Generic[ModelType]):
             self.cross_attention(decoder_layer).forward = self.create_cross_attn_pre_forward_hook(self.cross_attention(decoder_layer).forward, decoder_layer, i)
 
         # Inject our hook function in the beginning of generation.
-        # When the "model.generate()" will be called, it will first call our "reset_generation()" function, 
+        # When the "model.generate()" will be called, 
+        # it will first call our "reset_generation()" function, 
         # and only then call "model.generate()"
         self.original_generate_func = model.generate
+        print("replacing the pre_generate hook...")
         model.generate = self.pre_generate_hook
 
+        print("replacing the pre_forward hook...")
         model.forward = self.pre_forward_hook
         
+
         self.original_reorder_cache_func = model._reorder_cache
+        print("replacing the reorder_cache hook...")
         model._reorder_cache = self.reorder_cache_hook
+        
+        print("And now self.hooks_injected = True!")
+        print("---===|||===---")
         self.hooks_injected = True
 
+
     def inject_training_hooks(self, model):
+        print("Unlimiformer.inject_training_hooks was just called...")
         if self.training_hooks_injected:
             return
         # self.original_forward_func = model.forward
+        print("setting model.forward = self.pre_forward_hook...")
         model.forward = self.pre_forward_hook
 
+        print("calling self.attention_layer_to_run...")
         decoder_layers_to_run = self.attention_layer_to_run(self.layer_begin, self.layer_end)
         
         self.original_decoder_layer_self_attn_forward_funcs = []
-        for decoder_layer in decoder_layers_to_run:
+        for decoder_layer in tqdm(decoder_layers_to_run):
             attention = self.self_attention(decoder_layer)
             self.original_decoder_layer_self_attn_forward_funcs.append(attention.forward)
+            print("calling create_self_attn_pre_forward_hook...")
             attention.forward = self.create_self_attn_pre_forward_hook(attention.forward)
 
         self.original_decoder_layer_cross_attn_forward_funcs = []
-        for i, decoder_layer in enumerate(decoder_layers_to_run):
+        for i, decoder_layer in tqdm(enumerate(decoder_layers_to_run)):
             attention = self.cross_attention(decoder_layer)
             self.original_decoder_layer_cross_attn_forward_funcs.append(attention.forward)
+            print("calling create_cross_attn_pre_forward_hook...")
             attention.forward = self.create_cross_attn_pre_forward_hook(attention.forward, decoder_layer, i)
 
         self.original_decoder_layer_forward_funcs = []
         for decoder_layer in decoder_layers_to_run:
             self.original_decoder_layer_forward_funcs.append(decoder_layer.forward)
+            print("calling create_decoder_layer_func...")
             decoder_layer.forward = self.create_decoder_layer_func(decoder_layer.forward, decoder_layer)
 
+        print("calling self.inject_hooks_for_unaffected_layers...")
         self.inject_hooks_for_unaffected_layers(model, decoder_layers_to_run)
 
+        print("defining our attention_layers_to_run as self.attention_op_to_run...")
         attention_layers_to_run = self.attention_op_to_run(self.layer_begin, self.layer_end)
-        for layer in attention_layers_to_run:
+        for layer in tqdm(attention_layers_to_run):
+            print("calling self.register_hook for our train attention forward hooks...")
             self.register_hook(layer, self.train_attention_forward_hook)
 
+        print("And now self.training_hooks_injected = True")
         self.training_hooks_injected = True
 
-    def inject_hooks_for_unaffected_layers(self, model, decoder_layers_to_run):
+
+    def inject_hooks_for_unaffected_layers(self, 
+                                           model, 
+                                           decoder_layers_to_run):
         self.original_non_injected_decoder_layer_forward_funcs = []
         non_injected_decoder_layers = [l for l in self.attention_layer_to_run(0, None) 
             if l not in decoder_layers_to_run]
@@ -182,14 +478,21 @@ class Unlimiformer(Generic[ModelType]):
             self.original_non_injected_decoder_layer_forward_funcs.append(decoder_layer.forward)
             decoder_layer.forward = self.create_noninjected_decoder_layer_func(decoder_layer.forward, decoder_layer)
 
+
     def create_self_attn_pre_forward_hook(self, original_self_attn_forward_func):
+        
+        print("create_self_attn_pre_forward_hook was just called...")
+
         def self_attention_pre_forward_hook(*args, **kwargs):
             kwargs['past_key_value'] = None
             return original_self_attn_forward_func(*args, **kwargs)
         
         return self_attention_pre_forward_hook
 
-    def create_decoder_layer_func(self, decoder_layer_original_forward_func, decoder_layer):
+
+    def create_decoder_layer_func(self, 
+                                  decoder_layer_original_forward_func, 
+                                  decoder_layer):
         def checkpointed_decoder_layer(
                 hidden_states: torch.Tensor,
                 attention_mask=None,
@@ -204,13 +507,23 @@ class Unlimiformer(Generic[ModelType]):
                 use_cache=True):
 
            
-            def forward_with_all_keys(hidden_states, attention_mask, 
-                    encoder_hidden_states, encoder_attention_mask, layer_head_mask, 
-                    cross_attn_layer_head_mask, past_key_value, 
-                    output_attentions, use_cache, long_inputs, long_inputs_mask,
-                    position_bias, encoder_decoder_position_bias):
+            def forward_with_all_keys(hidden_states, 
+                                      attention_mask, 
+                                      encoder_hidden_states, 
+                                      encoder_attention_mask, 
+                                      layer_head_mask, 
+                                      cross_attn_layer_head_mask, 
+                                      past_key_value, 
+                                      output_attentions, 
+                                      use_cache, 
+                                      long_inputs, 
+                                      long_inputs_mask,
+                                      position_bias, 
+                                      encoder_decoder_position_bias):
                 
-                key, value = self.create_key_value(long_inputs, decoder_layer)
+                key, value = self.create_key_value(hidden_states=hidden_states,
+                                                   encoder_hidden_states=long_inputs, 
+                                                   decoder_layer=decoder_layer)
                 decoder_layer_args = self.create_decoder_layer_args(
                     hidden_states=hidden_states,
                     attention_mask=attention_mask,
@@ -223,19 +536,48 @@ class Unlimiformer(Generic[ModelType]):
                     position_bias=position_bias,
                     encoder_decoder_position_bias=encoder_decoder_position_bias,
                     use_cache=use_cache,
-                    key=key,value=value)
+                    key=key,
+                    value=value)
+
+                # print(f"and here are our decoder_layer_args: {decoder_layer_args}")
+
+                print("attempting another cleanup...")
+                if not self.is_encoder_decoder:
+                    print("removing unnecessary items from the args dict...")
+                    decoder_layer_args.pop("encoder_hidden_states", None)
+                    decoder_layer_args.pop("encoder_attention_mask", None)
+                    decoder_layer_args.pop("layer_head_mask", None)
+                    decoder_layer_args.pop("cross_attn_layer_head_mask", None)
+                    #del decoder_layer_args["encoder_hidden_states"]
+
+                    print(f"we now have these keys: {decoder_layer_args.keys()}")
+                    if "encoder_hidden_states" in decoder_layer_args.keys():
+                        print("What the hell?")
+                        sys.exit(1)
+
                 return decoder_layer_original_forward_func(**decoder_layer_args)
 
             return torch.utils.checkpoint.checkpoint(
-                forward_with_all_keys, hidden_states, attention_mask, 
-                encoder_hidden_states, encoder_attention_mask, layer_head_mask, 
-                cross_attn_layer_head_mask, None, 
-                output_attentions, use_cache, self.long_inputs_encoded, self.long_inputs_mask,
-                position_bias, encoder_decoder_position_bias)
+                forward_with_all_keys, 
+                hidden_states, 
+                attention_mask, 
+                encoder_hidden_states, 
+                encoder_attention_mask, 
+                layer_head_mask, 
+                cross_attn_layer_head_mask, 
+                None, 
+                output_attentions, 
+                use_cache, 
+                self.long_inputs_encoded, 
+                self.long_inputs_mask,
+                position_bias, 
+                encoder_decoder_position_bias)
 
         return checkpointed_decoder_layer
 
-    def create_noninjected_decoder_layer_func(self, decoder_layer_original_forward_func, decoder_layer):
+    def create_noninjected_decoder_layer_func(self, 
+                                              decoder_layer_original_forward_func, 
+                                              decoder_layer):
         def checkpointed_decoder_layer(
                 hidden_states: torch.Tensor,
                 attention_mask=None,
@@ -250,12 +592,20 @@ class Unlimiformer(Generic[ModelType]):
                 use_cache=True):
 
            
-            def forward_with_all_keys(hidden_states, attention_mask, 
-                    encoder_hidden_states, encoder_attention_mask, layer_head_mask, 
-                    cross_attn_layer_head_mask, past_key_value, 
-                    output_attentions, use_cache, long_inputs, long_inputs_mask,
-                    position_bias, encoder_decoder_position_bias):
-                
+            def forward_with_all_keys(hidden_states, 
+                                      attention_mask, 
+                                      encoder_hidden_states, 
+                                      encoder_attention_mask, 
+                                      layer_head_mask, 
+                                      cross_attn_layer_head_mask, 
+                                      past_key_value, 
+                                      output_attentions, 
+                                      use_cache, 
+                                      long_inputs, 
+                                      long_inputs_mask,
+                                      position_bias, 
+                                      encoder_decoder_position_bias):
+                                
                 decoder_layer_args = self.create_decoder_layer_args(
                     hidden_states=hidden_states,
                     attention_mask=attention_mask,
@@ -271,19 +621,33 @@ class Unlimiformer(Generic[ModelType]):
                 return decoder_layer_original_forward_func(**decoder_layer_args)
 
             return torch.utils.checkpoint.checkpoint(
-                forward_with_all_keys, hidden_states, attention_mask, 
-                encoder_hidden_states, encoder_attention_mask, layer_head_mask, 
-                cross_attn_layer_head_mask, None, 
-                output_attentions, use_cache, self.long_inputs_encoded, self.long_inputs_mask,
-                position_bias, encoder_decoder_position_bias)
+                forward_with_all_keys, 
+                hidden_states, 
+                attention_mask, 
+                encoder_hidden_states, 
+                encoder_attention_mask, 
+                layer_head_mask, 
+                cross_attn_layer_head_mask, 
+                None, 
+                output_attentions, 
+                use_cache, 
+                self.long_inputs_encoded, 
+                self.long_inputs_mask,
+                position_bias, 
+                encoder_decoder_position_bias)
 
         return checkpointed_decoder_layer
+
 
     def register_hook(self, layer, func, pre=False):
         handle = layer.register_forward_pre_hook(func) if pre else layer.register_forward_hook(func)
         self.hook_handles.append(handle)
 
+
     def break_out(self, model):
+
+        print("break_out was just called...")
+
         self.prompt_keys = []
         self.prompt_values = []
         self.prompt_attention_mask = []
@@ -301,9 +665,16 @@ class Unlimiformer(Generic[ModelType]):
         decoder_layers_to_run = self.attention_layer_to_run(self.layer_begin, self.layer_end)
         for decoder_layer, original_func in zip(decoder_layers_to_run, self.original_decoder_layer_cross_attn_forward_funcs):
             self.cross_attention(decoder_layer).forward = original_func
+        
+        print("and now self.hooks_injected = False")
+        
         self.hooks_injected = False
 
+
     def remove_training_hooks(self, model):
+
+        print("removing training hooks...")
+
         self.long_inputs_encoded, self.long_inputs_mask = None, None
         if not self.training_hooks_injected:
             return
@@ -324,27 +695,47 @@ class Unlimiformer(Generic[ModelType]):
         for decoder_layer, original_func in zip(non_injected_decoder_layers, self.original_non_injected_decoder_layer_forward_funcs):
             decoder_layer.forward = original_func
 
+
+        print("and now self.training_hooks_injected = False")
         self.training_hooks_injected = False
 
-    def reset_memory(self, input_ids, attention_mask):
+
+    def reset_memory(self, 
+                     input_ids, 
+                     attention_mask):
+        
+        print("reset memory was called...")
+
         if self.use_datastore:
-            self.datastore = DatastoreBatch(dim=self.model.config.hidden_size, batch_size=input_ids.shape[0], flat_index=self.flat_index, gpu_index=self.gpu_index)
+            self.datastore = DatastoreBatch(dim=self.model.config.hidden_size, 
+                                            batch_size=input_ids.shape[0], 
+                                            flat_index=self.flat_index, 
+                                            gpu_index=self.gpu_index)
             self.embeddings = []
             torch.cuda.empty_cache()
         self.prompt_input_ids = input_ids
-        self.input_ids = torch.tensor([], dtype=torch.long, device=input_ids.device)
+        self.input_ids = torch.tensor([], 
+                                      dtype=torch.long, 
+                                      device=input_ids.device)
         self.prompt_keys, self.prompt_values = None, None
         self.prev_tokens = [None for _ in range(len(self.original_decoder_layer_cross_attn_forward_funcs))]
         self.last_beam_idx = None
+        print("self.cur_layer_key_value_placeholder is set to `None`...")
         self.cur_layer_key_value_placeholder = None
         self.is_input_encoding_pass = True
-        dummy_labels = torch.zeros((input_ids.shape[0], 1), dtype=torch.long, device=input_ids.device)
+        dummy_labels = torch.zeros((input_ids.shape[0], 1), 
+                                   dtype=torch.long, 
+                                   device=input_ids.device)
         if self.save_heatmap:
             if self.heatmap is not None:
                 print(f'Generated: {self.tokenizer.decode(self.generated_input_ids[0])}')
                 self.plot_heatmap(self.heatmap[0].detach().cpu().numpy())
-            self.heatmap = torch.tensor([], dtype=torch.float, device=input_ids.device)
-        self.generated_input_ids = torch.tensor([], dtype=torch.long, device=input_ids.device)
+            self.heatmap = torch.tensor([], 
+                                    dtype=torch.float, 
+                                    device=input_ids.device)
+        self.generated_input_ids = torch.tensor([], 
+                                    dtype=torch.long, 
+                                    device=input_ids.device)
 
         self.prompt_keys = []
         self.prompt_values = []
@@ -354,7 +745,10 @@ class Unlimiformer(Generic[ModelType]):
         for context_start_ind, context_end_ind, update_start_ind, update_end_ind in window_indices:
             chunk = input_ids[:, context_start_ind:context_end_ind]
             chunk_attention_mask = attention_mask[:, context_start_ind:context_end_ind]
-            hidden_states = self.model(chunk, attention_mask=chunk_attention_mask, labels=dummy_labels, return_dict=True)
+            hidden_states = self.model(chunk, 
+                                attention_mask=chunk_attention_mask, 
+                                labels=dummy_labels, 
+                                return_dict=True)
             last_hidden = hidden_states.encoder_last_hidden_state # (batch, chunked_source_len, dim)
             if self.use_datastore:
                 to_add = last_hidden[:, update_start_ind:update_end_ind].detach()
@@ -405,6 +799,7 @@ class Unlimiformer(Generic[ModelType]):
                 f'{self.tokenizer.decode(input_ids[0][self.actual_model_window_size:], skip_special_tokens=True)}')
             print()
 
+
     def chunked_encode_input(self, input_ids, attention_mask):
         long_inputs_encoded = []
         long_inputs_mask = []
@@ -414,7 +809,10 @@ class Unlimiformer(Generic[ModelType]):
         for context_start_ind, context_end_ind, update_start_ind, update_end_ind in window_indices:
             chunk = input_ids[:, context_start_ind:context_end_ind]
             chunk_attention_mask = attention_mask[:, context_start_ind:context_end_ind]
-            output = self.model.base_model.encoder(chunk, attention_mask=chunk_attention_mask, return_dict=True, output_hidden_states=True)
+            output = self.model.base_model.encoder(chunk, 
+                                                attention_mask=chunk_attention_mask, 
+                                                return_dict=True, 
+                                                output_hidden_states=True)
             encoder_last_hidden_state = output.last_hidden_state # (batch, time, dim)
             
             # list of (batch, head, chunked_time, dim)
@@ -434,6 +832,7 @@ class Unlimiformer(Generic[ModelType]):
                 f'{self.tokenizer.decode(input_ids[0][self.actual_model_window_size:], skip_special_tokens=True)}')
             print()
         return long_inputs_encoded, long_inputs_mask
+
 
     def window_indices(self, total_seq_len):
         # Copied from SLED (Ivgy et al., 2022)
@@ -468,17 +867,35 @@ class Unlimiformer(Generic[ModelType]):
                 results.append((cs, ce, us, ue))
             return results
 
-    def pre_generate_hook(self, input_ids, **kwargs):
+
+    def pre_generate_hook(self, 
+                          input_ids, 
+                          **kwargs):
+        print("calling self.reset_memory...")
         self.reset_memory(input_ids, kwargs['attention_mask'])
         new_kwargs = kwargs
         if 'attention_mask' in kwargs:
             new_kwargs = {k: v for k, v in kwargs.items() if k != 'attention_mask'}
             new_kwargs['attention_mask'] = kwargs['attention_mask'][:, :self.actual_model_window_size]
         new_kwargs['use_cache'] = True
+
+
+        print("calling original generate...")
         return self.original_generate_func(input_ids[:, :self.actual_model_window_size], **new_kwargs)
 
-    def pre_forward_hook(self, input_ids=None, attention_mask=None, labels=None, **kwargs):
-        self.model.base_model.decoder.gradient_checkpointing = False
+
+    def pre_forward_hook(self, 
+                         input_ids=None, 
+                         attention_mask=None, 
+                         labels=None, 
+                         **kwargs):
+        print("Unlimiformer.pre_forward_hook was called...")
+        print(f"pre_forward_hook has received kwargs {kwargs}")
+        print("setting self.model.base_model.decoder.gradient_checkpointing = False")
+        if self.is_encoder_decoder:
+            self.model.base_model.decoder.gradient_checkpointing = False
+        else:
+            self.model.base_model.gradient_checkpointing = False
         if not self.is_input_encoding_pass:
             if self.model.training:
                 # self.reset_memory(input_ids, attention_mask)
@@ -496,16 +913,31 @@ class Unlimiformer(Generic[ModelType]):
                 if kwargs.get('decoder_input_ids') is not None:
                     self.generated_input_ids = torch.cat([self.generated_input_ids, kwargs['decoder_input_ids']], axis=-1)
             
-        result = self.original_forward_func(input_ids=input_ids, labels=labels, attention_mask=attention_mask, **kwargs)
+        print("calling our self.original_forward_func...")    
+        input(f"our original_forward_func is {self.original_forward_func}, \nand we'll be passing {kwargs} to it...")
+        print("@@@@@@@@@@@@@@@@@@@@@@\n"*4)
+        input("is this right?")
+        result = self.original_forward_func(input_ids=input_ids, 
+                                            labels=labels, 
+                                            attention_mask=attention_mask, 
+                                            **kwargs)
         self.is_first_test_decoding_step = False
+        print("...and returning result...")
         return result
 
+
     def create_cross_attn_pre_forward_hook(self, original_cross_attn_forward_func, decoder_layer, i):
+        
+        print("create_cross_attn_pre_forward_hook was just called...")
+        
         def attention_pre_forward_hook(hidden_states, attention_mask=None, *args, **kwargs):
             self.cur_decoder_layer_index = i
             if kwargs.get('past_key_value') is not None:
-                # it's a tuple, and we convert it to a list to be able to perform assignment 
-                # and modify its items from our attention_forward_hook
+                # it's a tuple, 
+                # and we convert it to a list 
+                # to be able to perform assignment 
+                # and modify its items 
+                # from our attention_forward_hook
                 self.cur_layer_key_value_placeholder = \
                     kwargs['past_key_value'] = list(kwargs['past_key_value']) # (batch, head, time, attn_dim)
 
@@ -524,9 +956,19 @@ class Unlimiformer(Generic[ModelType]):
         
         return attention_pre_forward_hook
 
-    def attention_forward_hook(self, module, input, output):
+
+    # this is where the magic happens
+    def attention_forward_hook(self, 
+                               module, 
+                               input, 
+                               output):
+        
+        print("attention_forward_hook was just called...")
+
         # output: (batch, time, 3 * heads * attention_dim)
-        if self.is_input_encoding_pass or self.is_first_test_decoding_step:
+        if self.is_input_encoding_pass \
+            or self.is_first_test_decoding_step:
+            print("in attention_forward_hook, returning...")
             return
         with torch.no_grad():
             query = self.process_query(output)[:,-1] # (batch * beam, head, dim)
@@ -568,7 +1010,8 @@ class Unlimiformer(Generic[ModelType]):
                 # embeddings: (batch, beam, head, actual_model_window_size, dim)
                 embeddings = embeddings.reshape((self.datastore.batch_size, -1, self.num_heads, self.actual_model_window_size, embeddings.shape[-1]))
                                     
-            # raw_values are actually token indices; need to look them up
+            # raw_values are actually token indices; 
+            # need to look them up
             if (not self.use_datastore) or self.test_datastore:
                 this_layer_prompt_keys = self.prompt_keys[self.cur_decoder_layer_index]
                 this_layer_prompt_values = self.prompt_values[self.cur_decoder_layer_index]
@@ -606,11 +1049,13 @@ class Unlimiformer(Generic[ModelType]):
 
             if self.verbose:
                 if self.is_encoder_decoder:
-                    for i, beam in enumerate(self.generated_input_ids):
+                    for i, beam in tqdm(enumerate(self.generated_input_ids)):
                         print(f'({i}) Generated: {self.tokenizer.decode(beam)}')
                 else:
                     print(f'Generated: {self.tokenizer.decode(self.input_ids)}')
                 print()
+        
+        print("this is where new_keys and new_values are formed...")
         
         if self.use_datastore:
             # k_proj_layer.weight, v_proj_layer.weight: (embed_dim, embed_dim)
@@ -641,16 +1086,28 @@ class Unlimiformer(Generic[ModelType]):
             assert torch.mean(torch.isclose(correct_keys, new_keys, rtol=1e-3, atol=1e-3).float()) > 0.99
             assert torch.mean(torch.isclose(correct_values, new_values, rtol=1e-3, atol=1e-3).float()) > 0.99
 
+
+        print("in attention_forward_hook,  setting self.cur_layer_key_value_placeholder")
         self.cur_layer_key_value_placeholder[0] = new_keys.flatten(0, 1)
         self.cur_layer_key_value_placeholder[1] = new_values.flatten(0, 1)
         return
 
-    def train_attention_forward_hook(self, module, input, output):
+
+    def train_attention_forward_hook(self, 
+                                     module, 
+                                     input, 
+                                     output):
+        
+        print("train_attention_forward_hook was just called...")
+
+
         # output: (batch, time, 3 * heads * attention_dim)
-        if self.is_input_encoding_pass or self.is_first_test_decoding_step:
+        if self.is_input_encoding_pass or \
+            self.is_first_test_decoding_step:
             return
         this_layer_prompt_keys = self.cur_layer_key_value_placeholder[0]
         this_layer_prompt_values = self.cur_layer_key_value_placeholder[1]
+        print(f"in train_attention_forward_hook, \nthis_layer_prompt_keys are {this_layer_prompt_keys}, \nand this_layer_prompt_values are {this_layer_prompt_values}")
         with torch.no_grad():
             query = self.process_query(output) # (batch * beam, tgt_len, head, dim)
             # query = query[:, :, self.head_nums] # (batch * beam, head, dim)
@@ -692,6 +1149,10 @@ class Unlimiformer(Generic[ModelType]):
 
 
     def reorder_cache_hook(self, past, beam_idx):
+
+        print("reorder_cache_hook was just called...")
+
+
         self.last_beam_idx = beam_idx
         self.generated_input_ids = self.generated_input_ids[beam_idx]
         for i, layer_prev_tokens in enumerate(self.prev_tokens):
@@ -701,10 +1162,21 @@ class Unlimiformer(Generic[ModelType]):
             self.heatmap = self.heatmap[beam_idx]
         return self.original_reorder_cache_func(past, beam_idx)
     
+
+    # that's the method we're primarily supposed to use
     @classmethod
     def convert_model(cls, model, *args, **kwargs):
-        model_clone = AutoModelForSeq2SeqLM.from_config(model.config)
-        model_clone.load_state_dict(model.state_dict())
+        # TODO: perhaps extend this 
+        # to handle our LLaMA?
+        # print(f"convert_model has just received model {model}, it has methods {dir(model)}")
+        # print(f"it has name {model._get_name} and another name {model.name_or_path}")
+        # input("ok?")
+        if "llama" in model.name_or_path:
+            # TODO: is this the best way to handle this?
+            model_clone = model
+        else:    
+            model_clone = AutoModelForSeq2SeqLM.from_config(model.config)
+            model_clone.load_state_dict(model.state_dict())
         type_to_class = {
             BartModel: UnlimiformerBART,
             BartForConditionalGeneration: UnlimiformerBART,
@@ -712,12 +1184,28 @@ class Unlimiformer(Generic[ModelType]):
             T5ForConditionalGeneration: UnlimiformerT5,
             LEDModel: UnlimiformerLED,
             LEDForConditionalGeneration: UnlimiformerLED,
+            LlamaModel: UnlimiformerLlama,
+            LlamaForCausalLM: UnlimiformerLlama,
+            LlamaForCausalLMWithFlashAttn: UnlimiformerLlamaWithFlashAttn,
         }
-        type_to_class[type(model_clone)](model_clone, *args, **kwargs)
+        
+        model_clone = type_to_class[type(model_clone)](model_clone, *args, **kwargs)
+        
+        print(f"we'll be returning this model: {model_clone}")
+        # input("are you sure that's what you want?")
+        
         return model_clone
         
 
-    def plot_heatmap(self, data, xticklabels='auto', yticklabels='auto'):
+
+    def plot_heatmap(self, 
+                     data, 
+                     xticklabels='auto', 
+                     yticklabels='auto'):
+        
+        print("plotting heatmap...")
+
+
         # data: (heads, targets, source_len)
         import seaborn as sb
         import matplotlib.pyplot as plt
@@ -728,7 +1216,7 @@ class Unlimiformer(Generic[ModelType]):
         # print(']')
 
         # sb.set(font_scale=1.5, rc={'text.usetex': True})
-        for i in range(data.shape[0]):
+        for i in trange(data.shape[0]):
             fig, axes = plt.subplots(1, 1, figsize=(40, 100))
             cur_ax = axes
             axes.set_title(f'Head #{i}, length: {data.shape[2]}, target length: {data.shape[1]}')
@@ -742,9 +1230,18 @@ class Unlimiformer(Generic[ModelType]):
             plt.show()
 
 
+
+
+####################################
+## Specific Model Definitions below
+####################################
+
+
+
 class UnlimiformerBART(Unlimiformer[BartModel]):
     def __init__(self, model: BartModel, *args, **kwargs):
         super().__init__(model, *args, **kwargs)
+
 
     def create_key_value(self, encoder_hidden_states, decoder_layer):
         # (batch, time, hidden_dim)
@@ -756,6 +1253,7 @@ class UnlimiformerBART(Unlimiformer[BartModel]):
         value = value.view(value.shape[0], -1, attention.num_heads, attention.head_dim).transpose(1, 2).contiguous()
         # key, value: (batch, heads, time, attn_dim)
         return key, value 
+
 
     def process_key_value(self, capturers):
         key_capturer, value_capturer = capturers
@@ -770,6 +1268,7 @@ class UnlimiformerBART(Unlimiformer[BartModel]):
         
         return key, value
 
+
     def process_query(self, output):
         # (batch, time, heads, attn_dim)
         attention = self.model.base_model.decoder.layers[-1].encoder_attn
@@ -778,29 +1277,38 @@ class UnlimiformerBART(Unlimiformer[BartModel]):
         query = output.view(output.shape[0], output.shape[1], attention.num_heads, attention.head_dim).contiguous()
         return query
 
+
     def attention_layer_to_capture(self, layer_begin, layer_end): 
         return [
             [layer.encoder_attn.k_proj, layer.encoder_attn.v_proj]
-            for layer in self.model.base_model.decoder.layers[layer_begin:layer_end]
+            for layer 
+            in self.model.base_model.decoder.layers[layer_begin:layer_end]
         ]
+
 
     def attention_op_to_run(self, layer_begin, layer_end):
         return [
             layer.encoder_attn.q_proj
-                for layer in self.model.base_model.decoder.layers[layer_begin:layer_end]
+                for layer 
+                in self.model.base_model.decoder.layers[layer_begin:layer_end]
         ]
+
 
     def attention_layer_to_run(self, layer_begin, layer_end): 
         return self.model.base_model.decoder.layers[layer_begin:layer_end]
 
+
     def self_attention(self, decoder_layer):
         return decoder_layer.self_attn 
+
 
     def cross_attention(self, decoder_layer):
         return decoder_layer.encoder_attn
     
+
     def window_size(self):
         return self.model.config.max_position_embeddings
+
 
     def create_decoder_layer_args(self, hidden_states, attention_mask, encoder_hidden_states,
                 encoder_attention_mask, layer_head_mask, cross_attn_layer_head_mask,
@@ -818,6 +1326,8 @@ class UnlimiformerBART(Unlimiformer[BartModel]):
         if key is None and value is None:
             args['past_key_value'] = None
         return args
+
+
 
 class UnlimiformerT5(Unlimiformer[T5Model]):
     def __init__(self, model: T5Model, *args, **kwargs):
@@ -901,6 +1411,8 @@ class UnlimiformerT5(Unlimiformer[T5Model]):
             args['past_key_value'] = None
         return args
 
+
+
 class UnlimiformerLED(UnlimiformerBART):
     def __init__(self, model: LEDModel, *args, **kwargs):
         super().__init__(model, *args, **kwargs)
@@ -908,16 +1420,247 @@ class UnlimiformerLED(UnlimiformerBART):
     def window_size(self):
         return self.model.config.max_encoder_position_embeddings
 
-class ActivationCapturer(nn.Module):
-    def __init__(self, layer, capture_input=False):
-        super().__init__()
-        self.layer = layer
-        self.capture_input = capture_input
 
-        self.captured = None
+# this is a copy of 
+# UnlimiformerBART
+# this might not work out of the box
+# TODO: test extensively
+class UnlimiformerLlama(Unlimiformer[LlamaForCausalLM]):
+    def __init__(self, model: LlamaForCausalLM, *args, **kwargs):
+        super().__init__(model, *args, **kwargs)
+        input("We've just called super.__init__ \
+              from UnlimiformerLlama.__init__")
 
+    def create_key_value(self, 
+                        encoder_hidden_states, 
+                        decoder_layer):
+        # (batch, time, hidden_dim)
+        
+        # TODO: figure out the correct names:
+        # this is called encoder_attn in Bart
+        # and layer[1].EncDecAttention in T5
+        attention = decoder_layer.encoder_attn
+        # key, value: (batch, heads, time, attn_dim)
+        # TODO: k_proj vs k
+        key = attention.k_proj(encoder_hidden_states)
+        # TODO: num_heads vs n_heads, 
+        # head_dim vs key_value_proj_dim
+        key = key.view(key.shape[0], -1, attention.num_heads, attention.head_dim).transpose(1, 2).contiguous()
+        # TODO: v_proj vs v
+        value = attention.v_proj(encoder_hidden_states)
+        value = value.view(value.shape[0], -1, attention.num_heads, attention.head_dim).transpose(1, 2).contiguous()
+        # key, value: (batch, heads, time, attn_dim)
+        return key, value 
+
+
+    def process_key_value(self, capturers):
+        key_capturer, value_capturer = capturers
+        key, value = key_capturer.captured, value_capturer.captured
+        # (batch, time, heads, attn_dim)
+        # TODO: decoder.layers vs decoder.block.layer
+        # ecoder_attn vs EncDecAttention
+        attention = self.model.base_model.decoder.layers[-1].encoder_attn
+
+        # query, key, value: (batch, heads, time, attn_dim)
+        # query = query.view(query.shape[0], query.shape[1], attention.num_heads, attention.head_dim).transpose(1, 2).contiguous()
+        key = key.view(key.shape[0], -1, attention.num_heads, attention.head_dim).transpose(1, 2).contiguous()
+        value = value.view(value.shape[0], -1, attention.num_heads, attention.head_dim).transpose(1, 2).contiguous()
+        
+        return key, value
+
+
+    def process_query(self, output):
+        # (batch, time, heads, attn_dim)
+        attention = self.model.base_model.decoder.layers[-1].encoder_attn
+        # query: (batch, heads, time, attn_dim)
+        # query = output.view(output.shape[0], output.shape[1], attention.num_heads, attention.head_dim).transpose(1, 2).contiguous()
+        query = output.view(output.shape[0], output.shape[1], attention.num_heads, attention.head_dim).contiguous()
+        return query
+
+
+    def attention_layer_to_capture(self, layer_begin, layer_end): 
+        return [
+            [layer.encoder_attn.k_proj, layer.encoder_attn.v_proj]
+            for layer 
+            in self.model.base_model.decoder.layers[layer_begin:layer_end]
+        ]
+
+
+    def attention_op_to_run(self, layer_begin, layer_end):
+        return [
+            layer.encoder_attn.q_proj
+                for layer 
+                in self.model.base_model.decoder.layers[layer_begin:layer_end]
+        ]
+
+
+    def attention_layer_to_run(self, layer_begin, layer_end): 
+        print(f"our model is {self.model.base_model}")
+        return self.model.base_model.decoder.layers[layer_begin:layer_end]
+
+
+    def self_attention(self, decoder_layer):
+        return decoder_layer.self_attn 
+
+
+    def cross_attention(self, decoder_layer):
+        return decoder_layer.encoder_attn
     
-    def forward(self, module, input, output):
-        self.captured = input if self.capture_input else output
-        if not self.layer.training:
-            self.captured = self.captured.detach()
+
+    def window_size(self):
+        # TODO: max_position_embeddings vs n_positions
+        return self.model.config.max_position_embeddings
+
+
+    def create_decoder_layer_args(self, 
+                                hidden_states, 
+                                attention_mask, 
+                                encoder_hidden_states,
+                                encoder_attention_mask, 
+                                layer_head_mask, 
+                                cross_attn_layer_head_mask,
+                                past_key_value, 
+                                output_attentions, 
+                                position_bias,
+                                encoder_decoder_position_bias, 
+                                use_cache, 
+                                key, 
+                                value):
+        
+        # TODO: position_bias,
+        # encoder_decoder_position_bias ??
+        args = {'hidden_states': hidden_states, 
+                'attention_mask': attention_mask, 
+                'encoder_hidden_states': encoder_hidden_states, 
+                'encoder_attention_mask': encoder_attention_mask, 
+                'layer_head_mask': layer_head_mask, 
+                'cross_attn_layer_head_mask': cross_attn_layer_head_mask, 
+                'past_key_value': (None, None, key, value), 
+                'output_attentions': output_attentions, 
+                'use_cache': use_cache,}
+        if key is None and value is None:
+            args['past_key_value'] = None
+        return args
+
+
+
+# this is a copy of 
+# UnlimiformerBART
+# this might not work out of the box
+# TODO: test extensively
+class UnlimiformerLlamaWithFlashAttn(Unlimiformer[LlamaForCausalLMWithFlashAttn]):
+    def __init__(self, model: LlamaForCausalLMWithFlashAttn, *args, **kwargs):
+        super().__init__(model, *args, **kwargs)
+        input("We've just called super.__init__ \
+              from UnlimiformerLlamaWithFlashAttn.__init__")
+
+    def create_key_value(self, 
+                        encoder_hidden_states, 
+                        decoder_layer):
+        # (batch, time, hidden_dim)
+        
+        # TODO: figure out the correct names:
+        # this is called encoder_attn in Bart
+        # and layer[1].EncDecAttention in T5
+        attention = decoder_layer.encoder_attn
+        # key, value: (batch, heads, time, attn_dim)
+        # TODO: k_proj vs k
+        key = attention.k_proj(encoder_hidden_states)
+        # TODO: num_heads vs n_heads, 
+        # head_dim vs key_value_proj_dim
+        key = key.view(key.shape[0], -1, attention.num_heads, attention.head_dim).transpose(1, 2).contiguous()
+        # TODO: v_proj vs v
+        value = attention.v_proj(encoder_hidden_states)
+        value = value.view(value.shape[0], -1, attention.num_heads, attention.head_dim).transpose(1, 2).contiguous()
+        # key, value: (batch, heads, time, attn_dim)
+        return key, value 
+
+
+    def process_key_value(self, capturers):
+        key_capturer, value_capturer = capturers
+        key, value = key_capturer.captured, value_capturer.captured
+        # (batch, time, heads, attn_dim)
+        # TODO: decoder.layers vs decoder.block.layer
+        # ecoder_attn vs EncDecAttention
+        attention = self.model.base_model.decoder.layers[-1].encoder_attn
+
+        # query, key, value: (batch, heads, time, attn_dim)
+        # query = query.view(query.shape[0], query.shape[1], attention.num_heads, attention.head_dim).transpose(1, 2).contiguous()
+        key = key.view(key.shape[0], -1, attention.num_heads, attention.head_dim).transpose(1, 2).contiguous()
+        value = value.view(value.shape[0], -1, attention.num_heads, attention.head_dim).transpose(1, 2).contiguous()
+        
+        return key, value
+
+
+    def process_query(self, output):
+        # (batch, time, heads, attn_dim)
+        attention = self.model.base_model.decoder.layers[-1].encoder_attn
+        # query: (batch, heads, time, attn_dim)
+        # query = output.view(output.shape[0], output.shape[1], attention.num_heads, attention.head_dim).transpose(1, 2).contiguous()
+        query = output.view(output.shape[0], output.shape[1], attention.num_heads, attention.head_dim).contiguous()
+        return query
+
+
+    def attention_layer_to_capture(self, layer_begin, layer_end): 
+        return [
+            [layer.encoder_attn.k_proj, layer.encoder_attn.v_proj]
+            for layer 
+            in self.model.base_model.decoder.layers[layer_begin:layer_end]
+        ]
+
+
+    def attention_op_to_run(self, layer_begin, layer_end):
+        return [
+            layer.encoder_attn.q_proj
+                for layer 
+                in self.model.base_model.decoder.layers[layer_begin:layer_end]
+        ]
+
+
+    def attention_layer_to_run(self, layer_begin, layer_end): 
+        print(f"our model is {self.model.base_model}")
+        return self.model.base_model.decoder.layers[layer_begin:layer_end]
+
+
+    def self_attention(self, decoder_layer):
+        return decoder_layer.self_attn 
+
+
+    def cross_attention(self, decoder_layer):
+        return decoder_layer.encoder_attn
+    
+
+    def window_size(self):
+        # TODO: max_position_embeddings vs n_positions
+        return self.model.config.max_position_embeddings
+
+
+    def create_decoder_layer_args(self, 
+                                hidden_states, 
+                                attention_mask, 
+                                encoder_hidden_states,
+                                encoder_attention_mask, 
+                                layer_head_mask, 
+                                cross_attn_layer_head_mask,
+                                past_key_value, 
+                                output_attentions, 
+                                position_bias,
+                                encoder_decoder_position_bias, 
+                                use_cache, 
+                                key, 
+                                value):
+        
+        # TODO: position_bias,
+        # encoder_decoder_position_bias ??
+        args = {'hidden_states': hidden_states, 
+                'attention_mask': attention_mask, 
+                'encoder_hidden_states': encoder_hidden_states, 
+                'encoder_attention_mask': encoder_attention_mask, 
+                'layer_head_mask': layer_head_mask, 
+                'cross_attn_layer_head_mask': cross_attn_layer_head_mask, 
+                'past_key_value': (None, None, key, value), 
+                'output_attentions': output_attentions, 
+                'use_cache': use_cache,}
+        if key is None and value is None:
+            args['past_key_value'] = None
+        return args
